@@ -19,7 +19,7 @@ import pandas as pd
 import numpy as np
 from openai import OpenAI
 import baostock as bs
-import akshare as ak      # <--- 新增
+import akshare as ak
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="金韬短线实战系统", layout="wide")
@@ -49,11 +49,9 @@ class BaostockSession:
 
 
 def _bs_code(code: str) -> str:
-    """将6位股票代码转换为 baostock 格式，支持北交所"""
+    """将6位股票代码转换为 baostock 格式（仅支持沪深，不含北交所）"""
     if code.startswith(('600', '601', '603', '605', '688')):
         return f"sh.{code}"
-    elif code.startswith(('4', '8')):
-        return f"bj.{code}"
     return f"sz.{code}"
 
 
@@ -77,7 +75,6 @@ def get_stock_info_baostock(code: str, session: BaostockSession):
 
 
 def compute_macd(close, fast=12, slow=26, signal=9):
-    """计算MACD指标，返回DIF, DEA, MACD柱"""
     exp1 = close.ewm(span=fast, adjust=False).mean()
     exp2 = close.ewm(span=slow, adjust=False).mean()
     dif = exp1 - exp2
@@ -87,7 +84,6 @@ def compute_macd(close, fast=12, slow=26, signal=9):
 
 
 def compute_kdj(high, low, close, n=9, m1=3, m2=3):
-    """计算KDJ指标，返回K, D, J值"""
     low_list = low.rolling(n).min()
     high_list = high.rolling(n).max()
     rsv = (close - low_list) / (high_list - low_list) * 100
@@ -99,7 +95,6 @@ def compute_kdj(high, low, close, n=9, m1=3, m2=3):
 
 
 def get_technical_baostock(code: str, session: BaostockSession, days: int = 60) -> dict:
-    """获取技术指标，包括均线、成交量、MACD、KDJ及振幅等"""
     try:
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -118,7 +113,7 @@ def get_technical_baostock(code: str, session: BaostockSession, days: int = 60) 
             row = rs.get_row_data()
             if row:
                 data.append(row)
-        if not data or len(data) < 20:  # 放宽至20个交易日
+        if not data or len(data) < 20:
             return {}
         df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
         for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -126,32 +121,20 @@ def get_technical_baostock(code: str, session: BaostockSession, days: int = 60) 
         df = df.sort_values('date')
         df['MA5'] = df['close'].rolling(5).mean()
         df['MA20'] = df['close'].rolling(20).mean()
-
-        # 计算振幅
         df['amplitude'] = ((df['high'] - df['low']) / df['close'].shift(1) * 100).fillna(0)
 
-        # 计算MACD
         dif, dea, macd = compute_macd(df['close'])
-        df['DIF'] = dif
-        df['DEA'] = dea
-        df['MACD'] = macd
+        df['DIF'] = dif; df['DEA'] = dea; df['MACD'] = macd
 
-        # 计算KDJ
         k, d, j = compute_kdj(df['high'], df['low'], df['close'])
-        df['K'] = k
-        df['D'] = d
-        df['J'] = j
+        df['K'] = k; df['D'] = d; df['J'] = j
 
         latest = df.iloc[-1]
         prev = df.iloc[-2] if len(df) >= 2 else latest
-
-        # 成交量变化
         vol_change = ((latest['volume'] - prev['volume']) / prev['volume'] * 100 if prev['volume'] > 0 else 0)
-
-        # 近5日数据
         last5 = df.tail(5)
         avg_volume_5 = last5['volume'].mean()
-        avg_amount_5 = avg_volume_5 * latest['close'] / 10000  # 估算成交额（万元）
+        avg_amount_5 = avg_volume_5 * latest['close'] / 10000
         avg_amplitude_5 = last5['amplitude'].mean()
         today_amount = latest['volume'] * latest['close'] / 10000
         today_amplitude = latest['amplitude']
@@ -168,14 +151,8 @@ def get_technical_baostock(code: str, session: BaostockSession, days: int = 60) 
             'today_amplitude': today_amplitude,
             'today_amount_yi': today_amount / 1e4,
             'vol_ratio_vs_5': vol_ratio,
-            # MACD
-            'dif': latest['DIF'],
-            'dea': latest['DEA'],
-            'macd': latest['MACD'],
-            # KDJ
-            'k': latest['K'],
-            'd': latest['D'],
-            'j': latest['J'],
+            'dif': latest['DIF'], 'dea': latest['DEA'], 'macd': latest['MACD'],
+            'k': latest['K'], 'd': latest['D'], 'j': latest['J'],
         }
     except Exception as e:
         print(f"技术指标失败: {e}")
@@ -183,29 +160,12 @@ def get_technical_baostock(code: str, session: BaostockSession, days: int = 60) 
 
 
 def get_stock_news(code: str) -> list:
-    """
-    东方财富个股专属新闻。
-    返回 list of dict：{'label': 显示文字, 'url': 链接, 'title': 纯标题}
-    """
-    # 增加北交所支持（市场代码暂用2，若无效可改0）
-    if code.startswith(('600', '601', '603', '605', '688')):
-        market = 1
-    elif code.startswith(('4', '8')):
-        market = 2   # 北交所（测试用）
-    else:
-        market = 0
-    url = (
-        f"https://np-listapi.eastmoney.com/comm/wap/getListInfo"
-        f"?client=wap&type=1&mTypeAndCode={market}.{code}"
-        f"&pageSize=10&pageIndex=1&_={int(time.time() * 1000)}"
-    )
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "Referer": "https://wap.eastmoney.com/"
-    }
+    """东方财富个股专属新闻（仅沪深）"""
+    market = 1 if code.startswith(('600', '601', '603', '605', '688')) else 0
+    url = f"https://np-listapi.eastmoney.com/comm/wap/getListInfo?client=wap&type=1&mTypeAndCode={market}.{code}&pageSize=10&pageIndex=1&_={int(time.time() * 1000)}"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://wap.eastmoney.com/"}
     try:
         resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
         data = resp.json()
         items = data.get('data', {}).get('list', [])
         results = []
@@ -217,27 +177,17 @@ def get_stock_news(code: str) -> list:
             time_part = show_time[11:16] if len(show_time) >= 16 else ''
             if title:
                 label = f"[{media} {time_part}] {title}" if media else title
-                results.append({
-                    'label': label,
-                    'title': title,
-                    'url': art_url,
-                })
+                results.append({'label': label, 'title': title, 'url': art_url})
         return results[:10]
-    except Exception as e:
-        print(f"东方财富个股新闻失败: {e}")
-    return []
+    except Exception:
+        return []
 
 
-# ==================== 修复后的三个数据源函数 ====================
+# ==================== 数据源函数（含换手率，仅支持沪深） ====================
 
 def get_price_tencent(code: str) -> dict:
-    """腾讯财经实时行情 —— 使用 qt.gtimg.cn 接口，返回 ~ 分隔的数据"""
-    if code.startswith(('600', '601', '603', '605', '688')):
-        prefix = "sh"
-    elif code.startswith(('4', '8')):
-        prefix = "bj"
-    else:
-        prefix = "sz"
+    """腾讯财经实时行情（含换手率）"""
+    prefix = "sh" if code.startswith(('600', '601', '603', '605', '688')) else "sz"
     url = f"https://qt.gtimg.cn/q={prefix}{code}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -252,28 +202,58 @@ def get_price_tencent(code: str) -> dict:
         latest = float(parts[3])
         yesterday_close = float(parts[4])
         open_price = float(parts[5])
-        volume = int(float(parts[6])) * 100  # 手→股
+        volume = int(float(parts[6])) * 100
         high = float(parts[33])
         low = float(parts[34])
-        amount = float(parts[37]) * 1e4     # 万元→元
+        amount = float(parts[37]) * 1e4
         change_pct = ((latest - yesterday_close) / yesterday_close * 100) if yesterday_close else None
+        # 换手率（腾讯接口索引38是换手率，百分比值，如 2.35）
+        turnover = float(parts[38]) if len(parts) > 38 and parts[38] else None
+
         return {
             'price': latest,
             'change_pct': round(change_pct, 2) if change_pct is not None else None,
-            'open': open_price,
-            'high': high,
-            'low': low,
+            'open': open_price, 'high': high, 'low': low,
             'yesterday_close': yesterday_close,
-            'volume': volume,
-            'amount': amount,
-            'amount_yi': amount / 1e8,
+            'volume': volume, 'amount': amount, 'amount_yi': amount / 1e8,
+            'turnover': turnover,  # 换手率（%）
         }
-    except (ValueError, IndexError, requests.RequestException):
+    except Exception:
         return None
 
 
+def get_price_sina(code: str) -> dict:
+    """新浪财经（备用，无换手率，保持兼容）"""
+    prefix = "sh" if code.startswith(('600', '601', '603', '605', '688')) else "sz"
+    url = f"https://hq.sinajs.cn/list={prefix}{code}"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.encoding = 'gbk'
+        text = resp.text
+        if '="' in text:
+            parts = text.split('="')[1].split('"')[0].split(',')
+            if len(parts) >= 10:
+                latest = float(parts[3])
+                yesterday_close = float(parts[2])
+                change_pct = ((latest - yesterday_close) / yesterday_close * 100) if yesterday_close else None
+                return {
+                    'price': latest,
+                    'change_pct': round(change_pct, 2) if change_pct is not None else None,
+                    'open': float(parts[1]), 'high': float(parts[4]), 'low': float(parts[5]),
+                    'yesterday_close': yesterday_close,
+                    'volume': int(float(parts[6])) if parts[6] else 0,
+                    'amount': float(parts[7]) if parts[7] else 0.0,
+                    'amount_yi': float(parts[7]) / 1e8 if parts[7] else 0.0,
+                    'turnover': None,  # 新浪此接口无换手率
+                }
+    except Exception:
+        pass
+    return None
+
+
 def get_price_akshare_single(code: str) -> dict:
-    """AkShare 买卖盘接口 —— 单股实时数据，含最新价/昨收等"""
+    """AkShare 买卖盘（无换手率）"""
     try:
         df = ak.stock_bid_ask_em(symbol=code)
         info = dict(zip(df['item'], df['value']))
@@ -290,25 +270,17 @@ def get_price_akshare_single(code: str) -> dict:
             'low': float(info.get('最低', 0)) or None,
             'yesterday_close': yesterday_close or None,
             'volume': int(float(info.get('总手', 0))) or None,
-            'amount': None,          # 该接口不提供成交额
-            'amount_yi': None,
+            'amount': None, 'amount_yi': None,
+            'turnover': None,
         }
     except Exception:
         return None
 
 
 def get_price_eastmoney_direct(code: str) -> dict:
-    """东方财富直连 —— 修正字段映射，并处理 /100 缩放"""
-    if code.startswith(('600', '601', '603', '605', '688')):
-        market = 1
-    elif code.startswith(('4', '8')):
-        market = 2   # 北交所（测试）
-    else:
-        market = 0
-    url = (
-        f"https://push2.eastmoney.com/api/qt/stock/get"
-        f"?secid={market}.{code}&fields=f43,f44,f45,f46,f47,f48,f60,f170"
-    )
+    """东方财富直连（含换手率 f168，仅沪深）"""
+    market = 1 if code.startswith(('600', '601', '603', '605', '688')) else 0
+    url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={market}.{code}&fields=f43,f44,f45,f46,f47,f48,f60,f170,f168"
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         data = resp.json().get('data')
@@ -316,154 +288,91 @@ def get_price_eastmoney_direct(code: str) -> dict:
             return None
         return {
             'price': data['f43'] / 100,
-            'change_pct': data.get('f170'),      # 已为百分比数值
+            'change_pct': data.get('f170'),
             'open': data['f46'] / 100,
             'high': data['f44'] / 100,
             'low': data['f45'] / 100,
             'yesterday_close': data['f60'] / 100,
-            'volume': data['f47'] * 100,         # 手→股
+            'volume': data['f47'] * 100,
             'amount': data['f48'],
             'amount_yi': data['f48'] / 1e8,
+            'turnover': data.get('f168'),  # 换手率（%）——缩放规则尚未权威确认，建议实测核对
         }
-    except (KeyError, TypeError, ZeroDivisionError, requests.RequestException):
+    except Exception:
         return None
 
 
 def get_realtime_price(code: str) -> dict:
-    """多源容错：按优先级尝试腾讯、新浪、AkShare、东财，baostock最后兜底"""
-    # 第一层：腾讯（最快）
+    """多源容错（腾讯优先，因为含换手率）—— 只负责4个外部HTTP源，不碰baostock"""
     result = get_price_tencent(code)
     if result and result.get('price') is not None:
         return result
 
-    # 第二层：新浪（原版）
-    result = get_price_sina(code)   # 这个函数在你代码中应该存在，是原先写的那个
+    result = get_price_sina(code)
     if result and result.get('price') is not None:
         return result
 
-    # 第三层：AkShare 买卖盘
     result = get_price_akshare_single(code)
     if result and result.get('price') is not None:
         return result
 
-    # 第四层：东财直连
     result = get_price_eastmoney_direct(code)
     if result and result.get('price') is not None:
         return result
 
-    # 最终兜底：用 baostock 最近一日收盘价
+    return {}  # 4个外部源都失败，交给调用方决定是否用baostock兜底
+
+
+def get_baostock_fallback_price(code: str, session: BaostockSession) -> dict:
+    """baostock 兜底 —— 必须传入外层已登录的 session，绝不自己开新连接（避免嵌套登出把外层连接搞断）"""
     try:
-        with BaostockSession() as session:
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-            rs = bs.query_history_k_data_plus(
-                code=_bs_code(code),
-                fields="date,close,volume",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="2"
-            )
-            data = []
-            while rs.next():
-                row = rs.get_row_data()
-                if row:
-                    data.append(row)
-            if data:
-                last = data[-1]
-                price = float(last[1])
-                vol = int(float(last[2])) if last[2] else None
-                return {
-                    'price': price,
-                    'change_pct': None,
-                    'open': None,
-                    'high': None,
-                    'low': None,
-                    'yesterday_close': None,
-                    'volume': vol,
-                    'amount': None,
-                    'amount_yi': None,
-                }
-    except Exception:
-        pass
-
-    return {}   # 所有源均失败
-
-
-# 保留原新浪函数（用于第二层）
-def get_price_sina(code: str) -> dict:
-    """新浪财经实时行情（原有函数）"""
-    if code.startswith(('600', '601', '603', '605', '688')):
-        prefix = "sh"
-    elif code.startswith(('4', '8')):
-        prefix = "bj"
-    else:
-        prefix = "sz"
-    url = f"https://hq.sinajs.cn/list={prefix}{code}"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=5)
-        resp.encoding = 'gbk'
-        text = resp.text
-        if '="' in text:
-            parts = text.split('="')[1].split('"')[0].split(',')
-            if len(parts) >= 10:
-                latest = float(parts[3])
-                yesterday_close = float(parts[2])
-                change_pct = ((latest - yesterday_close) / yesterday_close * 100) if yesterday_close else None
-                return {
-                    'price': latest,
-                    'change_pct': round(change_pct, 2) if change_pct is not None else None,
-                    'open': float(parts[1]),
-                    'high': float(parts[4]),
-                    'low': float(parts[5]),
-                    'yesterday_close': yesterday_close,
-                    'volume': int(float(parts[6])) if parts[6] else 0,
-                    'amount': float(parts[7]) if parts[7] else 0.0,
-                    'amount_yi': float(parts[7]) / 1e8 if parts[7] else 0.0,
-                }
-    except Exception:
-        pass
-    return None
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+        rs = bs.query_history_k_data_plus(
+            code=_bs_code(code),
+            fields="date,close,volume",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2"
+        )
+        data = []
+        while rs.next():
+            row = rs.get_row_data()
+            if row:
+                data.append(row)
+        if data:
+            last = data[-1]
+            return {
+                'price': float(last[1]),
+                'change_pct': None,
+                'open': None, 'high': None, 'low': None,
+                'yesterday_close': None,
+                'volume': int(float(last[2])) if last[2] else None,
+                'amount': None, 'amount_yi': None,
+                'turnover': None,
+            }
+    except Exception as e:
+        print(f"baostock 兜底失败: {e}")
+    return {}
 
 
 def render_news_html(news_items: list) -> str:
-    """将新闻列表渲染为可点击链接的 HTML"""
     if not news_items:
-        return """
-        <div style="max-height:340px; overflow-y:auto; background:#1e1e2f;
-                    padding:12px; border-radius:12px;">
-            <p style="color:#ffaa00; text-align:center;">暂无相关资讯</p>
-        </div>
-        """
+        return """<div style="max-height:340px; overflow-y:auto; background:#1e1e2f; padding:12px; border-radius:12px;"><p style="color:#ffaa00; text-align:center;">暂无相关资讯</p></div>"""
     rows = []
     for item in news_items:
         label = html.escape(item['label'])
-        url   = html.escape(item['url'])
+        url = html.escape(item['url'])
         if url:
-            row = (
-                f'<p style="border-bottom:1px solid #2a2a3f; padding:7px 0; margin:0; line-height:1.5;">'
-                f'• <a href="{url}" target="_blank" '
-                f'style="color:#00ff9d; text-decoration:none;">'
-                f'{label}</a></p>'
-            )
+            row = f'<p style="border-bottom:1px solid #2a2a3f; padding:7px 0; margin:0; line-height:1.5;">• <a href="{url}" target="_blank" style="color:#00ff9d; text-decoration:none;">{label}</a></p>'
         else:
-            row = (
-                f'<p style="color:#00ff9d; border-bottom:1px solid #2a2a3f; '
-                f'padding:7px 0; margin:0; line-height:1.5;">• {label}</p>'
-            )
+            row = f'<p style="color:#00ff9d; border-bottom:1px solid #2a2a3f; padding:7px 0; margin:0; line-height:1.5;">• {label}</p>'
         rows.append(row)
-    items_html = "".join(rows)
-    return f"""
-    <div style="max-height:340px; overflow-y:auto; background:#1e1e2f;
-                padding:14px; border-radius:12px; font-family:monospace; font-size:13px;">
-        {items_html}
-    </div>
-    """
+    return f"""<div style="max-height:340px; overflow-y:auto; background:#1e1e2f; padding:14px; border-radius:12px; font-family:monospace; font-size:13px;">{''.join(rows)}</div>"""
 
 
 # ==================== 界面 ====================
-
 st.title("🚀 金韬短线实战系统")
 st.markdown("---")
 
@@ -471,11 +380,7 @@ col1, col2 = st.columns([1, 2])
 
 with col1:
     st.subheader("📌 输入个股")
-    stock_code = st.text_input(
-        "请输入股票代码（6位数字）",
-        value="000001",
-        help="例如: 000001, 600519, 603318"
-    )
+    stock_code = st.text_input("请输入股票代码（6位数字）", value="000001", help="例如: 000001, 600519, 603318")
     analyze_btn = st.button("开始 AI 智能决策分析", type="primary", use_container_width=True)
     st.info("""
     **实战提示：**
@@ -486,7 +391,6 @@ with col1:
     """)
 
 
-# ==================== 输入校验 ====================
 if analyze_btn:
     if not stock_code.isdigit() or len(stock_code) != 6:
         st.error("请输入正确的6位股票代码（例如 000001）")
@@ -497,13 +401,10 @@ if analyze_btn:
         progress_bar = st.progress(0)
 
     try:
-        # ===== 步骤1：股票名称 & 技术指标（baostock 只连一次）=====
         progress_area.markdown("🔍 **步骤1/5**：正在识别股票信息...")
         progress_bar.progress(10)
-
         stock_name = stock_code
         tech = {}
-
         with BaostockSession() as session:
             name = get_stock_info_baostock(stock_code, session)
             if name:
@@ -513,71 +414,58 @@ if analyze_btn:
                 progress_area.markdown(f"⚠️ **步骤1/5**：名称获取失败，使用代码 {stock_code}")
             progress_bar.progress(20)
 
-            # 步骤2：实时股价（多源容错）
             progress_area.markdown("💰 **步骤2/5**：正在获取实时股价...")
             progress_bar.progress(30)
-            price_info = get_realtime_price(stock_code)  # 使用多源函数
-            price_text = (
-                f"{price_info['price']} 元 ({price_info['change_pct']:+.2f}%)"
-                if price_info and price_info.get('price') is not None else "获取失败"
+            price_info = get_realtime_price(stock_code)
+            if not price_info or price_info.get('price') is None:
+                # 四个外部源都失败，用 baostock 兜底，复用同一个已登录的 session
+                price_info = get_baostock_fallback_price(stock_code, session)
+            price_text = f"{price_info['price']} 元 ({price_info['change_pct']:+.2f}%)" if price_info and price_info.get('price') is not None and price_info.get('change_pct') is not None else (
+                f"{price_info['price']} 元" if price_info and price_info.get('price') is not None else "获取失败"
             )
             progress_bar.progress(40)
             progress_area.markdown(f"✅ **步骤2/5**：当前股价 {price_text}")
-
-            # 技术指标（同一 baostock 会话内完成，含MACD/KDJ）
             tech = get_technical_baostock(stock_code, session)
 
-        # ===== 步骤3：个股专属新闻 =====
         progress_area.markdown("📰 **步骤3/5**：正在获取个股新闻...")
         progress_bar.progress(50)
         news_items = get_stock_news(stock_code)
-
         with col2:
             st.markdown("### 📡 个股实时新闻（可点击）")
             st.markdown(render_news_html(news_items), unsafe_allow_html=True)
-
         progress_bar.progress(70)
         progress_area.markdown(f"✅ **步骤3/5**：已加载 {len(news_items)} 条个股新闻")
 
-        # ===== 步骤4：技术指标展示 =====
         progress_bar.progress(80)
         if tech:
-            tech_text = (
-                f"最新{tech['latest_price']:.2f}, "
-                f"MA5={tech['ma5']:.2f}, "
-                f"MA20={tech['ma20']:.2f}, "
-                f"量比{tech['volume_change']:+.1f}%"
-            )
+            tech_text = f"最新{tech['latest_price']:.2f}, MA5={tech['ma5']:.2f}, MA20={tech['ma20']:.2f}, 量比{tech['volume_change']:+.1f}%"
         else:
             tech_text = "计算失败"
         progress_area.markdown(f"✅ **步骤4/5**：{tech_text}")
         progress_bar.progress(85)
 
-        # ===== 步骤5：AI 分析（完整格式，含MACD/KDJ数据）=====
         progress_area.markdown("🧠 **步骤5/5**：AI 策略推演...")
         progress_bar.progress(90)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 收集详细数据（合并 price_info 和 tech）
         price_data = price_info if price_info else {}
         tech_data = tech if tech else {}
 
-        # 补充缺失字段（如果 price_info 缺价格，用 tech 的收盘价）
+        # 补全数据
         if not price_data.get('price') and tech_data.get('latest_price'):
             price_data['price'] = tech_data['latest_price']
         if not price_data.get('amount_yi') and tech_data.get('today_amount_yi'):
             price_data['amount_yi'] = tech_data['today_amount_yi']
-        if not price_data.get('volume') and tech_data.get('latest_price'):
-            # 用 tech 的 vol_ratio 和 avg_volume_5 无法直接得到 volume，保留 None
-            pass
 
-        # 提取关键字段（兼容 None）
+        # 提取字段（含换手率）
         open_price = price_data.get('open')
         high_price = price_data.get('high')
         low_price = price_data.get('low')
         yesterday_close = price_data.get('yesterday_close')
         current_price = price_data.get('price')
         amount_yi = price_data.get('amount_yi')
+        turnover = price_data.get('turnover')  # 换手率（%）
+
         today_amplitude = tech_data.get('today_amplitude', 0)
         if today_amplitude == 0 and high_price is not None and low_price is not None and yesterday_close is not None:
             if yesterday_close != 0:
@@ -591,6 +479,7 @@ if analyze_btn:
             except:
                 return str(value)
 
+        turnover_str = safe_float_str(turnover, ".2f")
         yesterday_close_str = safe_float_str(yesterday_close)
         open_price_str = safe_float_str(open_price)
         high_price_str = safe_float_str(high_price)
@@ -600,8 +489,7 @@ if analyze_btn:
         today_amplitude_str = safe_float_str(today_amplitude, ".2f")
         ma5_str = safe_float_str(tech_data.get('ma5'), ".2f")
         ma20_str = safe_float_str(tech_data.get('ma20'), ".2f")
-        
-        # 股价相对均线描述
+
         current_vs_ma = ''
         if current_price is not None:
             ma5_val = tech_data.get('ma5')
@@ -618,22 +506,17 @@ if analyze_btn:
             current_vs_ma = '，'.join(conditions)
         else:
             current_vs_ma = '现价数据缺失'
-        
+
         avg_amount_5_yi_str = safe_float_str(tech_data.get('avg_amount_5_yi'), ".2f")
         avg_amplitude_5_str = safe_float_str(tech_data.get('avg_amplitude_5'), ".2f")
         vol_ratio_str = safe_float_str(tech_data.get('vol_ratio_vs_5'), ".2f")
-
-        # MACD
         dif_str = safe_float_str(tech_data.get('dif'), ".3f")
         dea_str = safe_float_str(tech_data.get('dea'), ".3f")
         macd_str = safe_float_str(tech_data.get('macd'), ".3f")
-
-        # KDJ
         k_str = safe_float_str(tech_data.get('k'), ".2f")
         d_str = safe_float_str(tech_data.get('d'), ".2f")
         j_str = safe_float_str(tech_data.get('j'), ".2f")
 
-        # 构建详细数据描述
         data_summary = f"""
 ### 实时行情（{now_str}）
 - 昨日收盘：{yesterday_close_str}元
@@ -641,7 +524,7 @@ if analyze_btn:
 - 最高/最低/现价：{high_price_str} / {low_price_str} / {current_price_str}元
 - 今日振幅：{today_amplitude_str}%
 - 今日成交额：{amount_yi_str}亿元
-- 今日换手率：暂缺
+- 今日换手率：{turnover_str}%
 
 ### 技术指标（日线）
 - 5日均线：{ma5_str}元
@@ -665,24 +548,22 @@ if analyze_btn:
 {json.dumps([item['title'] for item in news_items], ensure_ascii=False, indent=2)}
 """
 
-        # 系统指令 + 严格格式（与之前相同，篇幅所限略去，但你在原代码中已有，我会保留）
-        # 注意：system_prompt 和 user_message 你用原来的就行，不需要改动。
-        # 但为了完整，这里我直接引用你原代码中的 system_prompt，你无需修改。
         system_prompt = f"""你是一位专业短线交易员，擅长技术分析。请严格按照以下步骤和格式，对用户提供的股票代码进行分析。
 
-**当前日期为：{now_str.split()[0]}**（今日盘中数据如上所示）。所有价格、成交量、MACD/KDJ等数据均基于上述提供的真实数据，不得编造。若某项数据缺失，请合理推断或指出“数据暂缺”。
+**当前日期为：{now_str.split()[0]}**。
 
 输出格式要求（必须按顺序执行，不可跳过）：
 
 ## 第一步：定性分析（判断是否适合短线）
-逐项核实以下三条，用表格形式输出：
+逐项核实以下四条，用表格形式输出：
 | 核对项 | 标准要求 | 该股票实际情况（基于上述数据） | 结论（✅/❌） |
 |--------|----------|--------------------------------|----------------|
 | 流动性 | 近5日日均成交额 ≥ 1亿元 | [填写实际数据] | |
 | 波动性 | 近5日日均振幅 ≥ 4% | [填写实际数据] | |
+| 筹码活跃度 | 今日换手率 ≥ 2% 或 近5日日均换手率 ≥ 2% | [填写实际数据] | |
 | 题材热度 | 是否属于近期市场热点板块（需列明具体概念） | [根据新闻标题和常识推测板块及催化剂] | |
 
-若三项均为✅，继续后续步骤；若有任何一项❌，直接输出“不建议短线操作”并终止。
+若四项均为✅，继续后续步骤；若有任何一项❌，直接输出“不建议短线操作”并终止。
 
 **风险前置提示**（若有）：列出该股已知的重大风险（如立案调查、业绩暴雷、异常波动公告、高负债等），每条用⚠️标注。
 
@@ -692,20 +573,21 @@ if analyze_btn:
 - 今日开盘/最高/最低/现价：xx / xx / xx / xx元
 - 今日振幅：xx%
 - 今日成交额：xx亿元
-- 今日换手率：xx%（如无则忽略）
+- 今日换手率：xx%
 - 5日均线位置：xx元；20日均线位置：xx元
 - 当前股价相对于均线的状态（如：跌破5日线、仍在20日线上方等）
 - K线形态描述（如：高开低走收阴线/低开高走反包阳线/墓碑线/长下影线等）
 
-用一段话总结：目前处于【上涨中继/回调企稳/破位反抽/高位震荡/其他】阶段。
+用一段话总结：目前处于【上涨中继/回调企稳/破位反抽/高位震荡/其他】阶段。**在判断时，请结合换手率的大小评判筹码锁定程度（换手率低代表惜售，高代表分歧大）。**
 
 ## 第三步：技术指标共振
-以表格形式输出以下五个指标的日线级别信号：
+以表格形式输出以下六个指标的日线级别信号：
 
 | 指标 | 当日信号（需量化） | 简要解读 |
 |------|------------------|----------|
 | 均线系统 | （依据均线位置） | |
 | 成交量 | （较5日均量倍数及放缩量情况） | |
+| 换手率 | （实际数值及与近期对比） | （结合价格判断：放量换手是吸筹还是出货） |
 | MACD | （DIF/DEA位置、金叉死叉、红绿柱变化） | |
 | KDJ | （K/D/J数值、超买超卖、金叉死叉） | |
 | 支撑/压力参考 | 支撑位：xx元；压力位：xx元 | |
@@ -722,7 +604,7 @@ if analyze_btn:
 - **买入时间**：（如：今日午后14:20-14:50/明日开盘后30分钟后再择机/等待回踩xx元后右侧确认等）
 - **参考买入价格区间**：xx元 - xx元
 - **计划仓位**：占总资金的百分比（如：不超过5%）
-- **买入前必须确认的条件**（列出2-3条硬性条件）
+- **买入前必须确认的条件**（列出2-3条硬性条件，例如：换手率回落至某个区间等）
 - **放弃买入的情形**（列出2-3条）
 
 ---
@@ -734,7 +616,7 @@ if analyze_btn:
 - **买入时间**：（例如：今日午后14:50-14:57 / 明日开盘后30分钟观察 / 等待回踩xx元后等）
 - **参考买入价格区间**：xx元 - xx元
 - **计划仓位**：占总资金的百分比（必须显著低于标准仓位，如≤3%-5%）
-- **买入前必须确认的条件**：列出2-3条硬性条件（例如：某时段股价不低于某价位；成交额达到某数值；大盘或板块不出现大幅下跌等）
+- **买入前必须确认的条件**：列出2-3条硬性条件
 - **放弃买入的情形**：列出2-3条触发放弃的具体信号
 - **特别风控**：买入后的特殊止损纪律（例如：次日开盘30分钟内无条件止损；不得补仓等）
 
@@ -772,42 +654,28 @@ if analyze_btn:
 {data_summary}
 请按照上述格式输出。"""
 
-        try:
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                timeout=60
-            )
-            raw = response.choices[0].message.content
-        except Exception as api_err:
-            st.error(f"AI 分析超时或失败：{api_err}")
-            st.stop()
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
+            timeout=60
+        )
+        raw = response.choices[0].message.content
 
         progress_bar.progress(98)
         progress_area.markdown("✨ 生成报告...")
-
-        display = raw
-
         progress_bar.empty()
         progress_area.empty()
 
         st.subheader(f"📊 {stock_name}({stock_code}) 决策报告")
         st.write(f"**⏰ {now_str}**  &nbsp;&nbsp; **💰 {price_text}**")
         st.success("AI 分析完成")
-        st.markdown(display)
+        st.markdown(raw)
         st.warning("⚠️ 仅供参考，投资需谨慎。")
 
     except RuntimeError as e:
         st.error(f"baostock 连接失败：{e}")
     except Exception as e:
         st.error(f"分析异常: {e}")
-        st.info("请检查网络连接，或稍后重试。")
 
 st.markdown("---")
-st.markdown(
-    "<p style='text-align:center; color:gray;'>Powered by baostock + 东方财富 + AkShare | 实时数据</p>",
-    unsafe_allow_html=True
-)
+st.markdown("<p style='text-align:center; color:gray;'>Powered by baostock + 东方财富 + AkShare | 含换手率分析</p>", unsafe_allow_html=True)

@@ -373,7 +373,7 @@ def render_news_html(news_items: list) -> str:
 
 
 # ==================== 界面 ====================
-st.title("🚀 金韬短线实战系统")
+st.title("🚀 金韬短线实战系统2.0")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 2])

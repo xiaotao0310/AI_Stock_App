@@ -14,7 +14,7 @@ import time
 import re
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 from openai import OpenAI
@@ -446,7 +446,7 @@ if analyze_btn:
 
         progress_area.markdown("🧠 **步骤5/5**：AI 策略推演...")
         progress_bar.progress(90)
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
         price_data = price_info if price_info else {}
         tech_data = tech if tech else {}

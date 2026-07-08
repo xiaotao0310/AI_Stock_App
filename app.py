@@ -175,10 +175,10 @@ def get_stock_news(code: str) -> list:
             show_time = item.get('Art_ShowTime', '').strip()
             art_url = item.get('Art_Url', '').strip()
             # 提取 月-日 时:分，例如 "07-08 14:30"
-time_part = show_time[5:16] if len(show_time) >= 16 else show_time
-if title:
-    label = f"[{media} {time_part}] {title}" if media else title
-                results.append({'label': label, 'title': title, 'url': art_url})
+    time_part = show_time[5:16] if len(show_time) >= 16 else show_time
+    if title:
+        label = f"[{media} {time_part}] {title}" if media else title
+        results.append({'label': label, 'title': title, 'url': art_url})
         return results[:10]
     except Exception:
         return []

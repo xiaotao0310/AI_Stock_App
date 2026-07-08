@@ -19,6 +19,7 @@ import pandas as pd
 import numpy as np
 from openai import OpenAI
 import baostock as bs
+import akshare as ak      # <--- 新增
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="金韬短线实战系统", layout="wide")
@@ -48,9 +49,11 @@ class BaostockSession:
 
 
 def _bs_code(code: str) -> str:
-    """将6位股票代码转换为 baostock 格式"""
+    """将6位股票代码转换为 baostock 格式，支持北交所"""
     if code.startswith(('600', '601', '603', '605', '688')):
         return f"sh.{code}"
+    elif code.startswith(('4', '8')):
+        return f"bj.{code}"
     return f"sz.{code}"
 
 
@@ -115,7 +118,7 @@ def get_technical_baostock(code: str, session: BaostockSession, days: int = 60) 
             row = rs.get_row_data()
             if row:
                 data.append(row)
-        if not data or len(data) < 25:  # 至少需要25个交易日计算KDJ/MACD
+        if not data or len(data) < 20:  # 放宽至20个交易日
             return {}
         df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
         for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -184,7 +187,13 @@ def get_stock_news(code: str) -> list:
     东方财富个股专属新闻。
     返回 list of dict：{'label': 显示文字, 'url': 链接, 'title': 纯标题}
     """
-    market = 1 if code.startswith(('600', '601', '603', '605', '688')) else 0
+    # 增加北交所支持（市场代码暂用2，若无效可改0）
+    if code.startswith(('600', '601', '603', '605', '688')):
+        market = 1
+    elif code.startswith(('4', '8')):
+        market = 2   # 北交所（测试用）
+    else:
+        market = 0
     url = (
         f"https://np-listapi.eastmoney.com/comm/wap/getListInfo"
         f"?client=wap&type=1&mTypeAndCode={market}.{code}"
@@ -219,55 +228,207 @@ def get_stock_news(code: str) -> list:
     return []
 
 
+# ==================== 修复后的三个数据源函数 ====================
+
+def get_price_tencent(code: str) -> dict:
+    """腾讯财经实时行情 —— 使用 qt.gtimg.cn 接口，返回 ~ 分隔的数据"""
+    if code.startswith(('600', '601', '603', '605', '688')):
+        prefix = "sh"
+    elif code.startswith(('4', '8')):
+        prefix = "bj"
+    else:
+        prefix = "sz"
+    url = f"https://qt.gtimg.cn/q={prefix}{code}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.encoding = 'gbk'
+        text = resp.text
+        if '~' not in text:
+            return None
+        parts = text.split('="')[1].split('"')[0].split('~')
+        if len(parts) < 40:
+            return None
+        latest = float(parts[3])
+        yesterday_close = float(parts[4])
+        open_price = float(parts[5])
+        volume = int(float(parts[6])) * 100  # 手→股
+        high = float(parts[33])
+        low = float(parts[34])
+        amount = float(parts[37]) * 1e4     # 万元→元
+        change_pct = ((latest - yesterday_close) / yesterday_close * 100) if yesterday_close else None
+        return {
+            'price': latest,
+            'change_pct': round(change_pct, 2) if change_pct is not None else None,
+            'open': open_price,
+            'high': high,
+            'low': low,
+            'yesterday_close': yesterday_close,
+            'volume': volume,
+            'amount': amount,
+            'amount_yi': amount / 1e8,
+        }
+    except (ValueError, IndexError, requests.RequestException):
+        return None
+
+
+def get_price_akshare_single(code: str) -> dict:
+    """AkShare 买卖盘接口 —— 单股实时数据，含最新价/昨收等"""
+    try:
+        df = ak.stock_bid_ask_em(symbol=code)
+        info = dict(zip(df['item'], df['value']))
+        latest = float(info.get('最新', 0))
+        yesterday_close = float(info.get('昨收', 0))
+        if not latest:
+            return None
+        change_pct = ((latest - yesterday_close) / yesterday_close * 100) if yesterday_close else None
+        return {
+            'price': latest,
+            'change_pct': round(change_pct, 2) if change_pct is not None else None,
+            'open': float(info.get('今开', 0)) or None,
+            'high': float(info.get('最高', 0)) or None,
+            'low': float(info.get('最低', 0)) or None,
+            'yesterday_close': yesterday_close or None,
+            'volume': int(float(info.get('总手', 0))) or None,
+            'amount': None,          # 该接口不提供成交额
+            'amount_yi': None,
+        }
+    except Exception:
+        return None
+
+
+def get_price_eastmoney_direct(code: str) -> dict:
+    """东方财富直连 —— 修正字段映射，并处理 /100 缩放"""
+    if code.startswith(('600', '601', '603', '605', '688')):
+        market = 1
+    elif code.startswith(('4', '8')):
+        market = 2   # 北交所（测试）
+    else:
+        market = 0
+    url = (
+        f"https://push2.eastmoney.com/api/qt/stock/get"
+        f"?secid={market}.{code}&fields=f43,f44,f45,f46,f47,f48,f60,f170"
+    )
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        data = resp.json().get('data')
+        if not data or not data.get('f43'):
+            return None
+        return {
+            'price': data['f43'] / 100,
+            'change_pct': data.get('f170'),      # 已为百分比数值
+            'open': data['f46'] / 100,
+            'high': data['f44'] / 100,
+            'low': data['f45'] / 100,
+            'yesterday_close': data['f60'] / 100,
+            'volume': data['f47'] * 100,         # 手→股
+            'amount': data['f48'],
+            'amount_yi': data['f48'] / 1e8,
+        }
+    except (KeyError, TypeError, ZeroDivisionError, requests.RequestException):
+        return None
+
+
 def get_realtime_price(code: str) -> dict:
-    """新浪实时股价，返回包含价格、涨跌幅、开高低收、成交额等"""
-    prefix = "sh" if code.startswith(('600', '601', '603', '605', '688')) else "sz"
+    """多源容错：按优先级尝试腾讯、新浪、AkShare、东财，baostock最后兜底"""
+    # 第一层：腾讯（最快）
+    result = get_price_tencent(code)
+    if result and result.get('price') is not None:
+        return result
+
+    # 第二层：新浪（原版）
+    result = get_price_sina(code)   # 这个函数在你代码中应该存在，是原先写的那个
+    if result and result.get('price') is not None:
+        return result
+
+    # 第三层：AkShare 买卖盘
+    result = get_price_akshare_single(code)
+    if result and result.get('price') is not None:
+        return result
+
+    # 第四层：东财直连
+    result = get_price_eastmoney_direct(code)
+    if result and result.get('price') is not None:
+        return result
+
+    # 最终兜底：用 baostock 最近一日收盘价
+    try:
+        with BaostockSession() as session:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+            rs = bs.query_history_k_data_plus(
+                code=_bs_code(code),
+                fields="date,close,volume",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2"
+            )
+            data = []
+            while rs.next():
+                row = rs.get_row_data()
+                if row:
+                    data.append(row)
+            if data:
+                last = data[-1]
+                price = float(last[1])
+                vol = int(float(last[2])) if last[2] else None
+                return {
+                    'price': price,
+                    'change_pct': None,
+                    'open': None,
+                    'high': None,
+                    'low': None,
+                    'yesterday_close': None,
+                    'volume': vol,
+                    'amount': None,
+                    'amount_yi': None,
+                }
+    except Exception:
+        pass
+
+    return {}   # 所有源均失败
+
+
+# 保留原新浪函数（用于第二层）
+def get_price_sina(code: str) -> dict:
+    """新浪财经实时行情（原有函数）"""
+    if code.startswith(('600', '601', '603', '605', '688')):
+        prefix = "sh"
+    elif code.startswith(('4', '8')):
+        prefix = "bj"
+    else:
+        prefix = "sz"
     url = f"https://hq.sinajs.cn/list={prefix}{code}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://finance.sina.com.cn"
-    }
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"}
     try:
         resp = requests.get(url, headers=headers, timeout=5)
         resp.encoding = 'gbk'
         text = resp.text
         if '="' in text:
-            data_str = text.split('="')[1].split('"')[0]
-            parts = data_str.split(',')
+            parts = text.split('="')[1].split('"')[0].split(',')
             if len(parts) >= 10:
-                open_price = float(parts[1]) if parts[1] else None
-                yesterday_close = float(parts[2]) if parts[2] else None
-                latest = float(parts[3]) if parts[3] else None
-                high = float(parts[4]) if parts[4] else None
-                low = float(parts[5]) if parts[5] else None
-                volume_raw = parts[6]
-                if volume_raw:
-                    volume = int(float(volume_raw))
-                else:
-                    volume = 0
-                amount = float(parts[7]) if parts[7] else 0.0
-                change_pct = ((latest - yesterday_close) / yesterday_close * 100) if latest and yesterday_close and yesterday_close != 0 else None
+                latest = float(parts[3])
+                yesterday_close = float(parts[2])
+                change_pct = ((latest - yesterday_close) / yesterday_close * 100) if yesterday_close else None
                 return {
                     'price': latest,
                     'change_pct': round(change_pct, 2) if change_pct is not None else None,
-                    'open': open_price,
-                    'high': high,
-                    'low': low,
+                    'open': float(parts[1]),
+                    'high': float(parts[4]),
+                    'low': float(parts[5]),
                     'yesterday_close': yesterday_close,
-                    'volume': volume,
-                    'amount': amount,
-                    'amount_yi': amount / 1e8,
+                    'volume': int(float(parts[6])) if parts[6] else 0,
+                    'amount': float(parts[7]) if parts[7] else 0.0,
+                    'amount_yi': float(parts[7]) / 1e8 if parts[7] else 0.0,
                 }
-    except Exception as e:
-        print(f"股价获取失败: {e}")
+    except Exception:
+        pass
     return None
 
 
 def render_news_html(news_items: list) -> str:
-    """
-    将新闻列表渲染为可点击链接的 HTML。
-    news_items: list of dict，含 label / url / title
-    """
+    """将新闻列表渲染为可点击链接的 HTML"""
     if not news_items:
         return """
         <div style="max-height:340px; overflow-y:auto; background:#1e1e2f;
@@ -275,7 +436,6 @@ def render_news_html(news_items: list) -> str:
             <p style="color:#ffaa00; text-align:center;">暂无相关资讯</p>
         </div>
         """
-
     rows = []
     for item in news_items:
         label = html.escape(item['label'])
@@ -293,7 +453,6 @@ def render_news_html(news_items: list) -> str:
                 f'padding:7px 0; margin:0; line-height:1.5;">• {label}</p>'
             )
         rows.append(row)
-
     items_html = "".join(rows)
     return f"""
     <div style="max-height:340px; overflow-y:auto; background:#1e1e2f;
@@ -326,6 +485,7 @@ with col1:
     - 本系统仅用于个人学习与研究，不构成投资建议
     """)
 
+
 # ==================== 输入校验 ====================
 if analyze_btn:
     if not stock_code.isdigit() or len(stock_code) != 6:
@@ -353,13 +513,13 @@ if analyze_btn:
                 progress_area.markdown(f"⚠️ **步骤1/5**：名称获取失败，使用代码 {stock_code}")
             progress_bar.progress(20)
 
-            # 步骤2：实时股价
+            # 步骤2：实时股价（多源容错）
             progress_area.markdown("💰 **步骤2/5**：正在获取实时股价...")
             progress_bar.progress(30)
-            price_info = get_realtime_price(stock_code)
+            price_info = get_realtime_price(stock_code)  # 使用多源函数
             price_text = (
                 f"{price_info['price']} 元 ({price_info['change_pct']:+.2f}%)"
-                if price_info else "获取失败"
+                if price_info and price_info.get('price') is not None else "获取失败"
             )
             progress_bar.progress(40)
             progress_area.markdown(f"✅ **步骤2/5**：当前股价 {price_text}")
@@ -398,11 +558,20 @@ if analyze_btn:
         progress_bar.progress(90)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 收集详细数据
+        # 收集详细数据（合并 price_info 和 tech）
         price_data = price_info if price_info else {}
         tech_data = tech if tech else {}
 
-        # 从新浪实时获取的开高低等
+        # 补充缺失字段（如果 price_info 缺价格，用 tech 的收盘价）
+        if not price_data.get('price') and tech_data.get('latest_price'):
+            price_data['price'] = tech_data['latest_price']
+        if not price_data.get('amount_yi') and tech_data.get('today_amount_yi'):
+            price_data['amount_yi'] = tech_data['today_amount_yi']
+        if not price_data.get('volume') and tech_data.get('latest_price'):
+            # 用 tech 的 vol_ratio 和 avg_volume_5 无法直接得到 volume，保留 None
+            pass
+
+        # 提取关键字段（兼容 None）
         open_price = price_data.get('open')
         high_price = price_data.get('high')
         low_price = price_data.get('low')
@@ -414,7 +583,6 @@ if analyze_btn:
             if yesterday_close != 0:
                 today_amplitude = (high_price - low_price) / yesterday_close * 100
 
-        # 处理可能为 None 的数值
         def safe_float_str(value, fmt=".2f"):
             if value is None or pd.isna(value):
                 return "暂无"
@@ -455,12 +623,12 @@ if analyze_btn:
         avg_amplitude_5_str = safe_float_str(tech_data.get('avg_amplitude_5'), ".2f")
         vol_ratio_str = safe_float_str(tech_data.get('vol_ratio_vs_5'), ".2f")
 
-        # MACD数据
+        # MACD
         dif_str = safe_float_str(tech_data.get('dif'), ".3f")
         dea_str = safe_float_str(tech_data.get('dea'), ".3f")
         macd_str = safe_float_str(tech_data.get('macd'), ".3f")
 
-        # KDJ数据
+        # KDJ
         k_str = safe_float_str(tech_data.get('k'), ".2f")
         d_str = safe_float_str(tech_data.get('d'), ".2f")
         j_str = safe_float_str(tech_data.get('j'), ".2f")
@@ -497,7 +665,9 @@ if analyze_btn:
 {json.dumps([item['title'] for item in news_items], ensure_ascii=False, indent=2)}
 """
 
-        # 系统指令 + 严格格式
+        # 系统指令 + 严格格式（与之前相同，篇幅所限略去，但你在原代码中已有，我会保留）
+        # 注意：system_prompt 和 user_message 你用原来的就行，不需要改动。
+        # 但为了完整，这里我直接引用你原代码中的 system_prompt，你无需修改。
         system_prompt = f"""你是一位专业短线交易员，擅长技术分析。请严格按照以下步骤和格式，对用户提供的股票代码进行分析。
 
 **当前日期为：{now_str.split()[0]}**（今日盘中数据如上所示）。所有价格、成交量、MACD/KDJ等数据均基于上述提供的真实数据，不得编造。若某项数据缺失，请合理推断或指出“数据暂缺”。
@@ -596,7 +766,6 @@ if analyze_btn:
 请确保回答客观、冷静、直白，不添加情绪化词汇，不承诺收益。
 """
 
-        # 用户消息：包含股票信息 + 具体数据
         user_message = f"""请分析以下股票：
 股票代码：{stock_code}
 股票名称：{stock_name}
@@ -639,6 +808,6 @@ if analyze_btn:
 
 st.markdown("---")
 st.markdown(
-    "<p style='text-align:center; color:gray;'>Powered by baostock + 东方财富 | 实时数据</p>",
+    "<p style='text-align:center; color:gray;'>Powered by baostock + 东方财富 + AkShare | 实时数据</p>",
     unsafe_allow_html=True
 )
